@@ -1,0 +1,36 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  sim_params.yaml  —  defaults for Gym / F1Tenth simulator
+#
+#  Pose source : /ego_racecar/odom  (nav_msgs/Odometry)
+#  Velocity    : same topic
+# ──────────────────────────────────────────────────────────────────────────────
+metrics_node:
+  ros__parameters:
+
+    # ── mode ──────────────────────────────────────────────────────────────────
+    use_hardware: false
+
+    # ── output ────────────────────────────────────────────────────────────────
+    # Override at launch with: output_dir:=/your/path
+    output_dir: "/workspaces/roboracer_ws/tmp/metrics"
+
+    # ── race line ──────────────────────────────────────────────────────────────
+    # Path to a CSV with one "x,y" waypoint per row (header / '#' lines ignored).
+    # Leave empty ("") to disable race-line deviation and sector metrics.
+    race_line_path: "/workspaces/roboracer_ws/src/f1tenth_race_metrics/f1tenth_race_metrics/race_lines/levine_blocked_waypoints.csv"
+
+    # ── velocity utilisation ───────────────────────────────────────────────────
+    # Maximum achievable speed on this map (m/s).
+    max_speed: 6.0
+    # Fraction of max_speed a step must exceed to count as "utilised".
+    vel_util_threshold_frac: 0.75
+
+    # ── lap detection ──────────────────────────────────────────────────────────
+    # Seconds that must pass after a crossing before another is registered.
+    # Set comfortably above the time it takes to drive a metre past the line.
+    lap_cooldown_s: 3.0
+
+    # ── sectors ────────────────────────────────────────────────────────────────
+    # Number of sectors per lap.  Requires a non-empty race_line_path.
+    # Set to 1 to disable sector splits.
+    num_sectors: 3

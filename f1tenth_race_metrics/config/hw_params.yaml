@@ -1,0 +1,31 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  hardware_params.yaml  —  defaults for the physical F1Tenth car
+#
+#  Pose source : /pf/viz/inferred_pose  (geometry_msgs/PoseStamped)
+#                from the particle-filter localiser
+#  Velocity    : /odom  (nav_msgs/Odometry) from the VESC motor controller
+# ──────────────────────────────────────────────────────────────────────────────
+metrics_node:
+  ros__parameters:
+
+    # ── mode ──────────────────────────────────────────────────────────────────
+    use_hardware: true
+
+    # ── output ────────────────────────────────────────────────────────────────
+    # Change to a path with enough storage space on the car's SBC.
+    output_dir: "/home/nvidia/f1tenth_metrics"
+
+    # ── race line ──────────────────────────────────────────────────────────────
+    race_line_path: ""
+
+    # ── velocity utilisation ───────────────────────────────────────────────────
+    # Tune to the actual VESC speed limit set for the run.
+    max_speed: 4.0
+    vel_util_threshold_frac: 0.75
+
+    # ── lap detection ──────────────────────────────────────────────────────────
+    # Slightly longer on hardware to account for PF latency near the start line.
+    lap_cooldown_s: 4.0
+
+    # ── sectors ────────────────────────────────────────────────────────────────
+    num_sectors: 3
