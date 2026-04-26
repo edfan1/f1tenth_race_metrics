@@ -17,7 +17,7 @@ metrics_node:
     # ── race line ──────────────────────────────────────────────────────────────
     # Path to a CSV with one "x,y" waypoint per row (header / '#' lines ignored).
     # Leave empty ("") to disable race-line deviation and sector metrics.
-    race_line_path: "/workspaces/roboracer_ws/src/f1tenth_race_metrics/f1tenth_race_metrics/race_lines/levine_blocked_waypoints.csv"
+    race_line_path: "/workspaces/roboracer_ws/src/f1tenth_race_metrics/race_lines/levine_blocked_waypoints.csv"
 
     # ── velocity utilisation ───────────────────────────────────────────────────
     # Maximum achievable speed on this map (m/s).

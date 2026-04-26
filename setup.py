@@ -20,7 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'f1tenth_race_metrics = f1tenth_race_metrics.f1tenth_race_metrics:main',
+            'f1tenth_race_metrics = f1tenth_race_metrics:main',
         ],
     },
 )
