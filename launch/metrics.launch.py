@@ -42,6 +42,9 @@ def _select_config(context, *args, **kwargs):
         "vel_util_threshold_frac": LaunchConfiguration("vel_util_threshold_frac"),
         "lap_cooldown_s":          LaunchConfiguration("lap_cooldown_s"),
         "num_sectors":             LaunchConfiguration("num_sectors"),
+        "stall_speed_threshold_m_s": LaunchConfiguration("stall_speed_threshold_m_s"),
+        "stall_duration_s":        LaunchConfiguration("stall_duration_s"),
+        "scan_freshness_s":        LaunchConfiguration("scan_freshness_s"),
     }
     if race_line_path_cli:
         param_overrides["race_line_path"] = race_line_path_cli
@@ -103,8 +106,27 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "num_sectors",
-            default_value="3",
+            default_value="1",
             description="Number of sectors to split each lap into (requires a race line CSV).",
+        ),
+
+        # ── stall detection ───────────────────────────────────────────────────
+        DeclareLaunchArgument(
+            "stall_speed_threshold_m_s",
+            default_value="0.1",
+            description="Speed threshold (m/s) below which the car is considered potentially stalled.",
+        ),
+        DeclareLaunchArgument(
+            "stall_duration_s",
+            default_value="3.0",
+            description="Duration (seconds) of sustained low speed before the lap is abandoned.",
+        ),
+
+        # ── scan freshness ────────────────────────────────────────────────────
+        DeclareLaunchArgument(
+            "scan_freshness_s",
+            default_value="0.05",
+            description="Maximum age (seconds) of a scan to be considered valid for the current step.",
         ),
 
         # ── node (config selected at launch time) ─────────────────────────────

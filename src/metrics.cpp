@@ -1,14 +1,37 @@
 #include "metrics.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <iomanip>
 #include <numeric>
 #include <sstream>
+#include <ctime>
 #include <stdexcept>
 
 namespace fs = std::filesystem;
+
+namespace
+{
+
+std::string humanReadableRunDirName()
+{
+    const auto now = std::chrono::system_clock::now();
+    const auto now_time = std::chrono::system_clock::to_time_t(now);
+    std::tm local_tm{};
+    localtime_r(&now_time, &local_tm);
+
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+
+    std::ostringstream oss;
+    oss << std::put_time(&local_tm, "%Y-%m-%d_%H-%M-%S")
+        << '.' << std::setw(3) << std::setfill('0') << milliseconds.count();
+    return oss.str();
+}
+
+}  // namespace
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  Constructor / Destructor
@@ -25,6 +48,9 @@ MetricsNode::MetricsNode(const rclcpp::NodeOptions & options)
     declare_parameter("race_line_path",           "");
     declare_parameter("lap_cooldown_s",           3.0);
     declare_parameter("num_sectors",              3);
+    declare_parameter("stall_speed_threshold_m_s", 0.1);
+    declare_parameter("stall_duration_s",          3.0);
+    declare_parameter("scan_freshness_s",          0.05);
 
     use_hardware_             = get_parameter("use_hardware").as_bool();
     output_dir_               = get_parameter("output_dir").as_string();
@@ -33,6 +59,9 @@ MetricsNode::MetricsNode(const rclcpp::NodeOptions & options)
     race_line_path_           = get_parameter("race_line_path").as_string();
     lap_cooldown_s_           = get_parameter("lap_cooldown_s").as_double();
     num_sectors_              = get_parameter("num_sectors").as_int();
+    stall_speed_threshold_    = get_parameter("stall_speed_threshold_m_s").as_double();
+    stall_duration_s_         = get_parameter("stall_duration_s").as_double();
+    scan_freshness_s_         = get_parameter("scan_freshness_s").as_double();
 
     // ── optional race line ────────────────────────────────────────────────────
     if (!race_line_path_.empty()) {
@@ -173,19 +202,33 @@ void MetricsNode::scanCb(const sensor_msgs::msg::LaserScan::SharedPtr msg)
     }
 
     if (min_r < std::numeric_limits<float>::max()) {
-        lap_clearances_.push_back(static_cast<double>(min_r));
+        const double d = static_cast<double>(min_r);
+        // Store timestamped reading for per-step freshness check
+        last_scan_min_   = d;
+        last_scan_stamp_ = rclcpp::Time(msg->header.stamp);
+        last_scan_valid_ = true;
+        // Also accumulate for lap-level clearance stats
+        lap_clearances_.push_back(d);
     }
 }
 
 void MetricsNode::driveCb(const ackermann_msgs::msg::AckermannDriveStamped::SharedPtr msg)
 {
-    cmd_steering_ = msg->drive.steering_angle;
-    cmd_speed_    = msg->drive.speed;
+    const double new_steer = msg->drive.steering_angle;
+    const double new_speed = msg->drive.speed;
 
     if (state_ == State::RACING) {
-        lap_ctrl_steer_ += std::abs(cmd_steering_);
-        lap_ctrl_speed_ += std::abs(cmd_speed_);
+        // Steering reversal: sign flip between two nonzero commands
+        if (cmd_steering_ != 0.0 && new_steer != 0.0 &&
+            std::signbit(new_steer) != std::signbit(cmd_steering_)) {
+            ++lap_steer_reversals_;
+        }
+        lap_ctrl_steer_ += std::abs(new_steer);
+        lap_ctrl_speed_ += std::abs(new_speed);
     }
+
+    cmd_steering_ = new_steer;
+    cmd_speed_    = new_speed;
 }
 
 void MetricsNode::stopCb(const std_msgs::msg::Bool::SharedPtr msg)
@@ -195,6 +238,9 @@ void MetricsNode::stopCb(const std_msgs::msg::Bool::SharedPtr msg)
             "Stop signal received — %d lap(s) recorded. Writing summary.", lap_count_);
         state_ = State::STOPPED;
         writeSummary();
+        if (step_csv_.is_open()) step_csv_.close();
+        if (lap_csv_.is_open())  lap_csv_.close();
+        laps_.clear();
     }
 }
 
@@ -216,9 +262,20 @@ void MetricsNode::processNewPose(double x, double y, double yaw,
 
     // ── WAITING: first pose after /initialpose — transition to RACING ─────────
     if (state_ == State::WAITING) {
+        // Don't start recording until the vehicle is actually moving.
+        // Some sources may publish an initial pose while the vehicle is still
+        // stationary; require a non-zero speed to begin a lap.
+        const double start_speed_thresh = 1e-3;
+        if (speed <= start_speed_thresh) {
+            return;
+        }
+
         state_      = State::RACING;
         lap_start_  = stamp;
         last_lap_stamp_ = stamp;
+
+        // create a unique per-run output directory and open CSV files there
+        openRunLogFiles(lap_start_);
 
         cur_sector_ = 0;
         sector_starts_.clear();
@@ -244,6 +301,30 @@ void MetricsNode::processNewPose(double x, double y, double yaw,
     const double dt = (stamp - prev_pose_stamp_).seconds();
     if (dt <= 0.0) return;   // duplicate or out-of-order message
 
+    // ── stall detection — abort lap if near-zero speed persists too long ──────
+    if (speed < stall_speed_threshold_) {
+        if (!in_stall_) {
+            in_stall_    = true;
+            stall_start_ = stamp;
+        } else if ((stamp - stall_start_).seconds() > stall_duration_s_) {
+            RCLCPP_WARN(get_logger(),
+                "Vehicle stalled for %.1f s — abandoning lap and waiting for a new /initialpose.",
+                (stamp - stall_start_).seconds());
+            in_stall_   = false;
+            start_set_  = false;
+            first_pose_ = true;
+            state_      = State::WAITING;
+            writeSummary();
+            if (step_csv_.is_open()) step_csv_.close();
+            if (lap_csv_.is_open())  lap_csv_.close();
+            laps_.clear();
+            resetLapAccumulators();
+            return;
+        }
+    } else {
+        in_stall_ = false;
+    }
+
     // jerk (m/s³) and yaw acceleration (rad/s²)
     const double accel     = (speed - prev_speed_) / dt;
     const double jerk      = (accel - prev_accel_) / dt;
@@ -252,20 +333,43 @@ void MetricsNode::processNewPose(double x, double y, double yaw,
     lap_jerks_.push_back(std::abs(jerk));
     lap_yaw_accels_.push_back(std::abs(yaw_accel));
 
+    // lateral acceleration (m/s²) — centripetal: v · ω
+    const double lat_accel = std::abs(speed * yaw_rate);
+    lap_lat_accels_.push_back(lat_accel);
+    if (lat_accel > peak_lat_accel_) peak_lat_accel_ = lat_accel;
+
+    // accelerating / braking / coasting (±0.1 m/s² dead zone to suppress noise)
+    if      (accel >  0.1) ++accel_steps_;
+    else if (accel < -0.1) ++brake_steps_;
+
     // velocity utilization
     if (speed >= vel_util_threshold_frac_ * max_speed_) ++vel_util_count_;
     ++step_count_;
 
     // race line deviation
     const double dev = racelineDeviation(x, y);
-    if (dev >= 0.0) lap_deviations_.push_back(dev);
+    if (dev >= 0.0) {
+        lap_deviations_.push_back(dev);
+        // Accumulate into current sector bucket (clamped to valid range)
+        if (!sector_dev_buckets_.empty()) {
+            const size_t bucket = static_cast<size_t>(
+                std::min(cur_sector_, static_cast<int>(sector_dev_buckets_.size()) - 1));
+            sector_dev_buckets_[bucket].push_back(dev);
+        }
+    }
 
     // sector crossing
     checkSectorCrossing(x, y, stamp);
 
-    // write step log row (use latest clearance if available)
-    const double min_scan = lap_clearances_.empty() ? -1.0 : lap_clearances_.back();
-    writeStepRow(stamp, dev, min_scan, jerk, yaw_accel);
+    // step log: use the most recent scan only if it arrived within scan_freshness_s_
+    double step_scan = -1.0;
+    if (last_scan_valid_) {
+        const double scan_age = (stamp - last_scan_stamp_).seconds();
+        if (scan_age >= 0.0 && scan_age <= scan_freshness_s_) {
+            step_scan = last_scan_min_;
+        }
+    }
+    writeStepRow(stamp, dev, step_scan, jerk, yaw_accel, lat_accel);
 
     // lap crossing
     checkLapCrossing(stamp);
@@ -342,6 +446,7 @@ void MetricsNode::finalizeLap(const rclcpp::Time & stamp)
     if (!lap_clearances_.empty()) {
         s.min_wall_clearance_m  = *std::min_element(lap_clearances_.begin(),
                                                       lap_clearances_.end());
+        s.p5_wall_clearance_m   = percentile(lap_clearances_, 5.0);
         const double sum = std::accumulate(lap_clearances_.begin(),
                                            lap_clearances_.end(), 0.0);
         s.mean_wall_clearance_m = sum / static_cast<double>(lap_clearances_.size());
@@ -356,8 +461,34 @@ void MetricsNode::finalizeLap(const rclcpp::Time & stamp)
         if (v.empty()) return 0.0;
         return std::accumulate(v.begin(), v.end(), 0.0) / static_cast<double>(v.size());
     };
-    s.mean_jerk_m_s3       = mean_vec(lap_jerks_);
+    s.mean_jerk_m_s3        = mean_vec(lap_jerks_);
     s.mean_yaw_accel_rad_s2 = mean_vec(lap_yaw_accels_);
+
+    // lateral acceleration
+    s.mean_lat_accel_m_s2 = mean_vec(lap_lat_accels_);
+    s.peak_lat_accel_m_s2 = peak_lat_accel_;
+
+    // steering reversals
+    s.steer_reversals = lap_steer_reversals_;
+
+    // accelerating / braking / coasting fractions
+    if (step_count_ > 0) {
+        const double n = static_cast<double>(step_count_);
+        s.accel_frac = static_cast<double>(accel_steps_) / n;
+        s.brake_frac = static_cast<double>(brake_steps_) / n;
+        s.coast_frac = static_cast<double>(step_count_ - accel_steps_ - brake_steps_) / n;
+    }
+
+    // sector mean deviation
+    s.sector_mean_dev_m.clear();
+    for (const auto & bucket : sector_dev_buckets_) {
+        if (!bucket.empty()) {
+            const double sum = std::accumulate(bucket.begin(), bucket.end(), 0.0);
+            s.sector_mean_dev_m.push_back(sum / static_cast<double>(bucket.size()));
+        } else {
+            s.sector_mean_dev_m.push_back(-1.0);
+        }
+    }
 
     // control effort (per-step average so lap length doesn't skew comparison)
     s.ctrl_effort_steer = (step_count_ > 0)
@@ -387,10 +518,17 @@ void MetricsNode::resetLapAccumulators()
     lap_clearances_.clear();
     lap_jerks_.clear();
     lap_yaw_accels_.clear();
-    lap_ctrl_steer_ = 0.0;
-    lap_ctrl_speed_ = 0.0;
-    vel_util_count_ = 0;
-    step_count_     = 0;
+    lap_lat_accels_.clear();
+    lap_ctrl_steer_      = 0.0;
+    lap_ctrl_speed_      = 0.0;
+    vel_util_count_      = 0;
+    step_count_          = 0;
+    accel_steps_         = 0;
+    brake_steps_         = 0;
+    peak_lat_accel_      = 0.0;
+    lap_steer_reversals_ = 0;
+    last_scan_valid_     = false;
+    sector_dev_buckets_.assign(static_cast<size_t>(std::max(num_sectors_, 1)), {});
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -503,15 +641,30 @@ void MetricsNode::loadRaceLine()
 
 void MetricsNode::openLogFiles()
 {
+    // Ensure base output directory exists. Per-run CSV files are opened
+    // when a race actually starts to create a unique subdirectory per run.
     fs::create_directories(output_dir_);
+    RCLCPP_INFO(get_logger(), "Base output dir ready: %s", output_dir_.c_str());
+}
 
-    step_csv_.open(output_dir_ + "/step_log.csv");
-    lap_csv_.open(output_dir_ + "/lap_log.csv");
+void MetricsNode::openRunLogFiles(const rclcpp::Time & start_stamp)
+{
+    (void)start_stamp;
+
+    // close existing files if any
+    if (step_csv_.is_open()) step_csv_.close();
+    if (lap_csv_.is_open())  lap_csv_.close();
+
+    run_output_dir_ = output_dir_ + "/" + humanReadableRunDirName();
+    fs::create_directories(run_output_dir_);
+
+    step_csv_.open(run_output_dir_ + "/step_log.csv");
+    lap_csv_.open(run_output_dir_ + "/lap_log.csv");
 
     if (!step_csv_.is_open() || !lap_csv_.is_open()) {
         RCLCPP_ERROR(get_logger(),
             "Failed to open log files in '%s' — check path and permissions.",
-            output_dir_.c_str());
+            run_output_dir_.c_str());
         return;
     }
 
@@ -522,6 +675,7 @@ void MetricsNode::openLogFiles()
         << "x_m,y_m,yaw_rad,"
         << "speed_m_s,yaw_rate_rad_s,"
         << "jerk_m_s3,yaw_accel_rad_s2,"
+        << "lat_accel_m_s2,"
         << "raceline_dev_m,"
         << "min_scan_m,"
         << "cmd_steering_rad,cmd_speed_m_s\n";
@@ -531,16 +685,19 @@ void MetricsNode::openLogFiles()
         << "lap,"
         << "lap_time_s,"
         << "mean_raceline_dev_m,p95_raceline_dev_m,"
-        << "min_wall_clearance_m,mean_wall_clearance_m,"
+        << "min_wall_clearance_m,p5_wall_clearance_m,mean_wall_clearance_m,"
         << "vel_utilization,"
         << "mean_jerk_m_s3,mean_yaw_accel_rad_s2,"
+        << "mean_lat_accel_m_s2,peak_lat_accel_m_s2,"
+        << "steer_reversals,"
+        << "accel_frac,brake_frac,coast_frac,"
         << "ctrl_effort_steer,ctrl_effort_speed\n";
 
-    RCLCPP_INFO(get_logger(), "Logging to: %s", output_dir_.c_str());
+    RCLCPP_INFO(get_logger(), "Logging to: %s", run_output_dir_.c_str());
 }
 
 void MetricsNode::writeStepRow(const rclcpp::Time & stamp, double dev, double min_scan,
-                                double jerk, double yaw_accel)
+                                double jerk, double yaw_accel, double lat_accel)
 {
     if (!step_csv_.is_open()) return;
     step_csv_ << std::fixed << std::setprecision(6)
@@ -549,6 +706,7 @@ void MetricsNode::writeStepRow(const rclcpp::Time & stamp, double dev, double mi
               << cur_x_            << "," << cur_y_ << "," << cur_yaw_ << ","
               << cur_speed_        << "," << cur_yaw_rate_ << ","
               << jerk              << "," << yaw_accel << ","
+              << lat_accel         << ","
               << dev               << ","
               << min_scan          << ","
               << cmd_steering_     << "," << cmd_speed_ << "\n";
@@ -563,10 +721,17 @@ void MetricsNode::writeLapRow(const LapStats & s)
              << s.mean_raceline_dev_m     << ","
              << s.p95_raceline_dev_m      << ","
              << s.min_wall_clearance_m    << ","
+             << s.p5_wall_clearance_m     << ","
              << s.mean_wall_clearance_m   << ","
              << s.velocity_utilization    << ","
              << s.mean_jerk_m_s3          << ","
              << s.mean_yaw_accel_rad_s2   << ","
+             << s.mean_lat_accel_m_s2     << ","
+             << s.peak_lat_accel_m_s2     << ","
+             << s.steer_reversals         << ","
+             << s.accel_frac              << ","
+             << s.brake_frac              << ","
+             << s.coast_frac              << ","
              << s.ctrl_effort_steer       << ","
              << s.ctrl_effort_speed       << "\n";
     lap_csv_.flush();  // flush after each lap so data is safe on hard stop
@@ -574,14 +739,21 @@ void MetricsNode::writeLapRow(const LapStats & s)
 
 void MetricsNode::writeSummary()
 {
-    if (laps_.empty()) {
-        RCLCPP_WARN(get_logger(), "No completed laps to summarise.");
+    const std::string summary_dir = run_output_dir_.empty() ? output_dir_ : run_output_dir_;
+    std::ofstream f(summary_dir + "/summary.txt");
+    if (!f.is_open()) {
+        RCLCPP_ERROR(get_logger(), "Could not write summary to %s", summary_dir.c_str());
         return;
     }
 
-    std::ofstream f(output_dir_ + "/summary.txt");
-    if (!f.is_open()) {
-        RCLCPP_ERROR(get_logger(), "Could not write summary to %s", output_dir_.c_str());
+    if (laps_.empty()) {
+        RCLCPP_WARN(get_logger(), "No completed laps to summarise.");
+        f << "══════════════════════════════════════════════════════\n"
+          << "  F1TENTH Metrics Summary\n"
+          << "══════════════════════════════════════════════════════\n\n"
+          << "Total laps completed : 0\n\n"
+          << "No completed laps were recorded for this run.\n";
+        RCLCPP_INFO(get_logger(), "Summary written to %s/summary.txt", summary_dir.c_str());
         return;
     }
 
@@ -617,8 +789,12 @@ void MetricsNode::writeSummary()
       << std::setw(W)  << "VelUtil"
       << std::setw(W)  << "MeanJerk"
       << std::setw(W)  << "YawAccel"
+      << std::setw(W)  << "LatAccel"
+      << std::setw(10) << "SteerRev"
+      << std::setw(11) << "Accel%"
+      << std::setw(11) << "Brake%"
       << "SectorSplits(s)\n";
-    f << std::string(5 + W * 7 + 20, '-') << "\n";
+    f << std::string(5 + W * 8 + 10 + 11 + 11 + 20, '-') << "\n";
 
     for (const auto & l : laps_) {
         f << std::left  << std::setw(5)  << l.lap_number
@@ -631,16 +807,43 @@ void MetricsNode::writeSummary()
           << std::setw(W) << l.velocity_utilization
           << std::setprecision(3)
           << std::setw(W) << l.mean_jerk_m_s3
-          << std::setw(W) << l.mean_yaw_accel_rad_s2;
+          << std::setw(W) << l.mean_yaw_accel_rad_s2
+          << std::setw(W) << l.mean_lat_accel_m_s2
+          << std::setw(10) << l.steer_reversals
+          << std::setprecision(1)
+          << std::setw(10) << (l.accel_frac * 100.0)
+          << std::setw(10) << (l.brake_frac  * 100.0);
 
         // sector splits inline
         for (size_t i = 0; i < l.sector_times_s.size(); ++i) {
-            f << (i == 0 ? "" : " | ") << l.sector_times_s[i];
+            f << (i == 0 ? "  " : " | ")
+              << std::fixed << std::setprecision(3) << l.sector_times_s[i];
         }
         f << "\n";
     }
 
-    RCLCPP_INFO(get_logger(), "Summary written to %s/summary.txt", output_dir_.c_str());
+    // ── sector mean deviation detail ──────────────────────────────────────────
+    const bool has_sector_dev = std::any_of(laps_.begin(), laps_.end(),
+        [](const LapStats & l){ return !l.sector_mean_dev_m.empty(); });
+
+    if (has_sector_dev) {
+        f << "\nSector Mean Raceline Deviation (m)  [-1 = no data]\n";
+        f << std::string(50, '-') << "\n";
+        for (const auto & l : laps_) {
+            f << "  Lap " << l.lap_number << ": ";
+            for (size_t i = 0; i < l.sector_mean_dev_m.size(); ++i) {
+                if (i > 0) f << " | ";
+                f << "S" << (i + 1) << " ";
+                if (l.sector_mean_dev_m[i] < 0.0)
+                    f << " n/a ";
+                else
+                    f << std::fixed << std::setprecision(3) << l.sector_mean_dev_m[i];
+            }
+            f << "\n";
+        }
+    }
+
+    RCLCPP_INFO(get_logger(), "Summary written to %s/summary.txt", summary_dir.c_str());
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

@@ -33,4 +33,13 @@ metrics_node:
     # ── sectors ────────────────────────────────────────────────────────────────
     # Number of sectors per lap.  Requires a non-empty race_line_path.
     # Set to 1 to disable sector splits.
-    num_sectors: 3
+    num_sectors: 1
+    # ── stall detection ─────────────────────────────────────────────────────────
+    # Speed threshold (m/s) below which the car is considered potentially stalled.
+    stall_speed_threshold_m_s: 0.1
+    # Duration (seconds) of sustained low speed before the lap is abandoned.
+    stall_duration_s: 3.0
+
+    # ── scan / lidar freshness ─────────────────────────────────────────────────────────
+    # Maximum age (seconds) of a scan to be considered valid for the current step.
+    scan_freshness_s: 0.05

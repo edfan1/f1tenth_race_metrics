@@ -24,6 +24,7 @@ struct LapStats {
 
     // wall clearance (metric 4)
     double min_wall_clearance_m{-1.0};
+    double p5_wall_clearance_m{-1.0};
     double mean_wall_clearance_m{-1.0};
 
     // velocity utilization (metric 6)
@@ -33,12 +34,25 @@ struct LapStats {
     double mean_jerk_m_s3{0.0};         // |da/dt|
     double mean_yaw_accel_rad_s2{0.0};  // |d(yaw_rate)/dt|
 
+    // lateral acceleration (metric 5)
+    double mean_lat_accel_m_s2{0.0};
+    double peak_lat_accel_m_s2{0.0};
+
     // control effort (metric 8)
     double ctrl_effort_steer{0.0};      // mean |steering_cmd| per step
     double ctrl_effort_speed{0.0};      // mean |speed_cmd| per step
 
+    // steering reversals
+    int steer_reversals{0};
+
+    // accelerating / braking / coasting fractions
+    double accel_frac{0.0};
+    double brake_frac{0.0};
+    double coast_frac{0.0};
+
     // sector splits (metric 1b)
     std::vector<double> sector_times_s;
+    std::vector<double> sector_mean_dev_m;  // mean deviation per sector
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,8 +71,9 @@ private:
     double      vel_util_threshold_frac_;
     std::string race_line_path_;
     double      lap_cooldown_s_;
-    int         num_sectors_;
-
+    int         num_sectors_;    double      stall_speed_threshold_;
+    double      stall_duration_s_;
+    double      scan_freshness_s_;
     // ── state machine ─────────────────────────────────────────────────────────
     enum class State { WAITING, RACING, STOPPED };
     State state_{State::WAITING};
@@ -97,22 +112,37 @@ private:
     std::vector<double> lap_clearances_;
     std::vector<double> lap_jerks_;
     std::vector<double> lap_yaw_accels_;
+    std::vector<double> lap_lat_accels_;
+    double peak_lat_accel_{0.0};
     double lap_ctrl_steer_{0.0};
     double lap_ctrl_speed_{0.0};
     int    vel_util_count_{0};
     int    step_count_{0};
+    int    accel_steps_{0};
+    int    brake_steps_{0};
+    int    lap_steer_reversals_{0};
 
     // ── race line ─────────────────────────────────────────────────────────────
     std::vector<std::array<double, 2>> race_line_;
     // indices into race_line_ that mark sector boundaries (num_sectors - 1 entries)
-    std::vector<size_t> sector_boundary_indices_;
+    std::vector<size_t> sector_boundary_indices_;    // per-sector deviation buckets for computing sector-level statistics
+    std::vector<std::vector<double>> sector_dev_buckets_;
 
+    // ── scan / clearance tracking ─────────────────────────────────────────────
+    double last_scan_min_{std::numeric_limits<double>::max()};
+    rclcpp::Time last_scan_stamp_;
+    bool last_scan_valid_{false};
+
+    // ── stall detection ───────────────────────────────────────────────────────
+    bool in_stall_{false};
+    rclcpp::Time stall_start_;
     // ── completed lap records ─────────────────────────────────────────────────
     std::vector<LapStats> laps_;
 
     // ── log file handles ──────────────────────────────────────────────────────
     std::ofstream step_csv_;   // per-timestep log
     std::ofstream lap_csv_;    // per-lap summary log
+    std::string run_output_dir_; // per-run subdirectory inside `output_dir_`
 
     // ── ROS subscriptions ─────────────────────────────────────────────────────
     // sim
@@ -156,8 +186,9 @@ private:
     // ── I/O helpers ───────────────────────────────────────────────────────────
     void loadRaceLine();
     void openLogFiles();
+    void openRunLogFiles(const rclcpp::Time & start_stamp);
     void writeStepRow(const rclcpp::Time & stamp, double dev, double min_scan,
-                      double jerk, double yaw_accel);
+                      double jerk, double yaw_accel, double lat_accel);
     void writeLapRow(const LapStats & s);
     void writeSummary();
 };
