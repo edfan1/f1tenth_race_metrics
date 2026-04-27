@@ -13,10 +13,10 @@ metrics_node:
 
     # ── output ────────────────────────────────────────────────────────────────
     # Change to a path with enough storage space on the car's SBC.
-    output_dir: "/home/nvidia/f1tenth_metrics"
+    output_dir: "/home/nvidia/f1tenth_metrics/data"
 
     # ── race line ──────────────────────────────────────────────────────────────
-    race_line_path: ""
+    race_line_path: "/home/nvidia/f1tenth_ws/src/f1tenth_race_metrics/race_lines/levine_race2_centerline.csv"
 
     # ── velocity utilisation ───────────────────────────────────────────────────
     # Tune to the actual VESC speed limit set for the run.
